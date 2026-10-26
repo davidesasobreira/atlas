@@ -143,31 +143,7 @@ function LoginPage() {
       if (error) throw error;
 
       if (data?.user) {
-        // 1. Tenta salvar na tabela compacta student_profiles
-        try {
-          await supabase.from('student_profiles').upsert({
-            id: data.user.id,
-            name: name.trim(),
-            role: 'student',
-            progress: initialProgress,
-            updated_at: new Date().toISOString()
-          });
-        } catch (dbErr) {
-          console.warn('[BFA DB] student_profiles ignorado ou gerenciado por trigger:', dbErr?.message);
-        }
 
-        // 2. Tenta salvar também na tabela profiles tradicional (role: student)
-        try {
-          await supabase.from('profiles').upsert({
-            id: data.user.id,
-            email: email.trim(),
-            full_name: name.trim(),
-            role: 'student',
-            updated_at: new Date().toISOString()
-          });
-        } catch (pErr) {
-          console.warn('[BFA DB] profiles ignorado ou gerenciado por trigger:', pErr?.message);
-        }
       }
 
       if (data?.session) {
