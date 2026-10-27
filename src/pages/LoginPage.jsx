@@ -2,7 +2,6 @@
    Brasil Finanças Atlas (BFA) — Página de Autenticação Unificada (Alunos & Admin)
    Arquivo: src/pages/LoginPage.jsx
    ========================================================================== */
-
 import React, { useState, useEffect, useContext, createContext } from 'react';
 import { ProgressContext } from '../context/ProgressContext';
 import { AdminContext } from '../context/AdminContext';
@@ -12,18 +11,26 @@ function LoginPage() {
   const { studentAuth, completedLessons, quizScores } = useContext(ProgressContext) || {};
   const adminCtx = useContext(AdminContext) || {};
   const [activeTab, setActiveTab] = useState('student-login'); // 'student-login' | 'student-register' | 'otp-verify'
-  
+
   // Form fields
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [otpToken, setOtpToken] = useState('');
-  
 
   // UI states
   const [isLoading, setIsLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
+
+  // Helper: retorna o client Supabase do wrapper BFA
+  const getClient = () => {
+    const sp = BfaSupabase || (typeof window !== 'undefined' ? window.BfaSupabase : null);
+    if (!sp || !sp.client) {
+      throw new Error('Serviço de autenticação Supabase indisponível no momento.');
+    }
+    return { sp, supabase: sp.client };
+  };
 
   // Login unico: depois de entrar, quem e da equipe (professor/admin) vai
   // direto ao painel; aluno vai para a pagina inicial.
@@ -52,40 +59,31 @@ function LoginPage() {
       setErrorMsg('Por favor, informe seu e-mail e senha.');
       return;
     }
-
     setIsLoading(true);
     setErrorMsg('');
     setSuccessMsg('');
-
     try {
-      const sp = BfaSupabase || (typeof window !== 'undefined' ? window.BfaSupabase : null);
-      if (!sp || !sp.client) {
-        throw new Error('Serviço de autenticação Supabase indisponível no momento.');
-      }
-
-      const supabase = sp.client;
+      const { sp, supabase } = getClient();
       const { data, error } = await supabase.auth.signInWithPassword({
         email: email.trim(),
         password: password
       });
-
       if (error) throw error;
-
       if (sp?.savePasswordCredential) {
         sp.savePasswordCredential(email.trim(), password, name || email.trim());
       }
-
       setSuccessMsg('Login realizado com sucesso! Sincronizando seu progresso...');
       if (studentAuth?.reloadProfile) {
         await studentAuth.reloadProfile();
       }
-
       await irDepoisDoLogin();
     } catch (err) {
       console.warn('[BFA Login] Erro no login do aluno:', err);
       let msg = err.message || 'Falha ao autenticar.';
       if (msg.includes('Invalid login credentials')) {
         msg = 'E-mail ou senha incorretos. Verifique suas credenciais ou use o acesso sem senha via OTP.';
+      } else if (msg.toLowerCase().includes('not confirmed')) {
+        msg = 'Confirme seu e-mail antes de entrar. Verifique sua caixa de entrada.';
       }
       setErrorMsg(msg);
     } finally {
@@ -94,109 +92,94 @@ function LoginPage() {
   };
 
   // Cadastro de Novo Aluno
+  // O perfil nasce no BANCO pela trigger on_auth_user_created → criar_perfil_aluno.
+  // Nenhum upsert aqui 
   const handleStudentRegister = async (e) => {
     e.preventDefault();
-    if (!name.trim() || !email.trim() || !password.trim()) {
-      setErrorMsg('Por favor, preencha todos os campos obrigatórios.');
+    setErrorMsg('');
+    setSuccessMsg('');
+
+    // ---- Validações ----
+    if (!name.trim()) {
+      setErrorMsg('Por favor, informe seu nome.');
       return;
     }
-
-    if (password.length < 6) {
+    if (!email.trim() || !/\S+@\S+\.\S+/.test(email)) {
+      setErrorMsg('Por favor, informe um e-mail válido.');
+      return;
+    }
+    if (!password || password.length < 6) {
       setErrorMsg('A senha deve conter no mínimo 6 caracteres.');
       return;
     }
 
     setIsLoading(true);
-    setErrorMsg('');
-    setSuccessMsg('');
-
     try {
-      const sp = BfaSupabase || (typeof window !== 'undefined' ? window.BfaSupabase : null);
-      if (!sp || !sp.client) {
-        throw new Error('Serviço de autenticação Supabase indisponível no momento.');
-      }
+      const { sp, supabase } = getClient();
 
-      const supabase = sp.client;
-      const localLessons = JSON.parse(localStorage.getItem('bfa_user_progress') || '[]');
-      const localScores = JSON.parse(localStorage.getItem('bfa_quiz_scores') || '{}');
-
-      const initialProgress = {
-        completed_lessons: localLessons,
-        quiz_scores: localScores,
-        badges: ['pioneiro_atlas']
-      };
-
-      const redirectUrl = typeof window !== 'undefined' ? (window.location.origin + window.location.pathname + '#/confirmacao') : '';
+      // redirect SEM fragmento — o supabase-js lê os tokens da URL sozinho
+      const redirectUrl = window.location.origin + window.location.pathname;
 
       const { data, error } = await supabase.auth.signUp({
         email: email.trim(),
         password: password,
         options: {
-          emailRedirectTo: redirectUrl,
-          data: {
-            name: name.trim(),
-            full_name: name.trim()
-          }
+          data: { name: name.trim() }, // ← a trigger usa esse 'name' no banco
+          emailRedirectTo: redirectUrl
         }
       });
 
-      if (error) throw error;
+      if (error) {
+        console.error('[BFA Register] Erro no cadastro:', error);
+        let msg = error.message || 'Não foi possível criar a conta. Tente novamente.';
+        if (msg.toLowerCase().includes('already registered')) {
+          msg = 'Este e-mail já está cadastrado. Por favor, faça login.';
+        } else if (msg.toLowerCase().includes('password')) {
+          msg = 'A senha não atende aos requisitos mínimos.';
+        }
+        setErrorMsg(msg);
+        return;
+      }
 
       if (data?.user) {
-        // 1. Tenta salvar na tabela compacta student_profiles
-        try {
-          await supabase.from('student_profiles').upsert({
-            id: data.user.id,
-            name: name.trim(),
-            role: 'student',
-            progress: initialProgress,
-            updated_at: new Date().toISOString()
-          });
-        } catch (dbErr) {
-          console.warn('[BFA DB] student_profiles ignorado ou gerenciado por trigger:', dbErr?.message);
+        if (data?.session) {
+          // Confirm email DESLIGADO (ou e-mail já confirmado): sessão ativa
+          if (sp?.savePasswordCredential) {
+            try {
+              sp.savePasswordCredential(email.trim(), password, name.trim());
+            } catch (credErr) {
+              console.warn('[BFA Cred] Falha ao salvar credencial:', credErr?.message);
+            }
+          }
+          setSuccessMsg('Cadastro realizado com sucesso! Conectando...');
+          if (studentAuth?.reloadProfile) {
+            try {
+              await studentAuth.reloadProfile();
+            } catch (profErr) {
+              console.warn('[BFA Profile] Falha ao recarregar perfil:', profErr?.message);
+            }
+          }
+          setTimeout(() => {
+            window.location.hash = '#/';
+          }, 1500);
+        } else {
+          // Confirm email LIGADO: usuário criado, aguardando confirmação
+          if (sp?.savePasswordCredential) {
+            try {
+              sp.savePasswordCredential(email.trim(), password, name.trim());
+            } catch (credErr) {
+              console.warn('[BFA Cred] Falha ao salvar credencial:', credErr?.message);
+            }
+          }
+          setSuccessMsg('Conta criada! Verifique sua caixa de entrada para confirmar o e-mail.');
+          setTimeout(() => {
+            handleTabChange('student-login');
+          }, 3000);
         }
-
-        // 2. Tenta salvar também na tabela profiles tradicional (role: student)
-        try {
-          await supabase.from('profiles').upsert({
-            id: data.user.id,
-            email: email.trim(),
-            full_name: name.trim(),
-            role: 'student',
-            updated_at: new Date().toISOString()
-          });
-        } catch (pErr) {
-          console.warn('[BFA DB] profiles ignorado ou gerenciado por trigger:', pErr?.message);
-        }
-      }
-
-      if (data?.session) {
-        if (sp?.savePasswordCredential) {
-          sp.savePasswordCredential(email.trim(), password, name.trim());
-        }
-        setSuccessMsg('Cadastro realizado com sucesso! Conectando...');
-        if (studentAuth?.reloadProfile) {
-          await studentAuth.reloadProfile();
-        }
-        setTimeout(() => {
-          window.location.hash = '#/';
-        }, 1000);
-      } else {
-        if (sp?.savePasswordCredential) {
-          sp.savePasswordCredential(email.trim(), password, name.trim());
-        }
-        setSuccessMsg('Conta de aluno criada com sucesso! Caso a confirmação de e-mail esteja ativada no seu Supabase, verifique sua caixa de entrada para confirmar o acesso.');
-        setTimeout(() => {
-          setActiveTab('student-login');
-        }, 2500);
       }
     } catch (err) {
-      console.warn('[BFA Register] Erro no cadastro:', err);
-      let msg = err.message || 'Falha ao criar conta.';
-      if (msg.includes('User already registered')) {
-        msg = 'Este e-mail já está cadastrado. Por favor, faça login.';
-      }
-      setErrorMsg(msg);
+      console.error('[BFA Register] Erro inesperado:', err);
+      setErrorMsg(err.message || 'Erro inesperado. Tente novamente.');
     } finally {
       setIsLoading(false);
     }
@@ -209,16 +192,14 @@ function LoginPage() {
       setErrorMsg('Por favor, informe seu e-mail.');
       return;
     }
-
     setIsLoading(true);
     setErrorMsg('');
     setSuccessMsg('');
-
     try {
       if (studentAuth?.signInWithEmail) {
         await studentAuth.signInWithEmail(email.trim(), name.trim());
         setSuccessMsg(`Código de acesso enviado para ${email}. Verifique seu e-mail.`);
-        setActiveTab('otp-verify');
+        handleTabChange('otp-verify');
       } else {
         throw new Error('Módulo de autenticação indisponível.');
       }
@@ -236,11 +217,9 @@ function LoginPage() {
       setErrorMsg('Por favor, informe o código de 6 dígitos.');
       return;
     }
-
     setIsLoading(true);
     setErrorMsg('');
     setSuccessMsg('');
-
     try {
       if (studentAuth?.verifyOtpCode) {
         await studentAuth.verifyOtpCode(email.trim(), otpToken.trim());
@@ -294,11 +273,9 @@ function LoginPage() {
     const userEmail = studentAuth.user?.email || '';
     const completedCount = completedLessons?.length || 0;
     const quizzesCount = Object.keys(quizScores || {}).length;
-
     return (
       <div style={{ minHeight: '80vh', padding: '4rem 1rem', backgroundColor: 'var(--bg-surface)' }}>
         <div style={{ maxWidth: '640px', margin: '0 auto', backgroundColor: 'var(--bg-app)', border: '1px solid var(--border-color)', borderRadius: 'var(--radius-lg)', padding: '3rem', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03)' }}>
-          
           <div style={{ display: 'flex', alignItems: 'center', gap: '1.25rem', marginBottom: '2rem', paddingBottom: '2rem', borderBottom: '1px solid var(--border-color)' }}>
             <div style={{ width: '64px', height: '64px', borderRadius: '50%', backgroundColor: 'var(--primary)', color: '#FFFFFF', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1.6rem', fontWeight: 800 }}>
               {userName.charAt(0).toUpperCase()}
@@ -317,7 +294,6 @@ function LoginPage() {
               </p>
             </div>
           </div>
-
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1rem', marginBottom: '3rem' }}>
             <div style={{ padding: '1.5rem 1rem', backgroundColor: 'var(--bg-surface)', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-color)', textAlign: 'center' }}>
               <div style={{ fontSize: '0.75rem', textTransform: 'uppercase', color: 'var(--text-secondary)', fontWeight: 700, letterSpacing: '0.05em' }}>Aulas Feitas</div>
@@ -325,14 +301,12 @@ function LoginPage() {
                 {completedCount} <span style={{ fontSize: '1rem', color: 'var(--text-muted)' }}>/ 55</span>
               </div>
             </div>
-
             <div style={{ padding: '1.5rem 1rem', backgroundColor: 'var(--bg-surface)', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-color)', textAlign: 'center' }}>
               <div style={{ fontSize: '0.75rem', textTransform: 'uppercase', color: 'var(--text-secondary)', fontWeight: 700, letterSpacing: '0.05em' }}>Quizzes</div>
               <div style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--primary)', marginTop: '0.5rem' }}>
                 {quizzesCount}
               </div>
             </div>
-
             <div style={{ padding: '1.5rem 1rem', backgroundColor: 'var(--bg-surface)', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-color)', textAlign: 'center' }}>
               <div style={{ fontSize: '0.75rem', textTransform: 'uppercase', color: 'var(--text-secondary)', fontWeight: 700, letterSpacing: '0.05em' }}>Sincronização</div>
               <div style={{ fontSize: '0.875rem', fontWeight: 700, color: studentAuth.isSyncing ? 'var(--primary)' : 'var(--accent-green)', marginTop: '1rem', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
@@ -341,7 +315,6 @@ function LoginPage() {
               </div>
             </div>
           </div>
-
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
             <a
               href="#/matematica"
@@ -370,7 +343,6 @@ function LoginPage() {
               Sair da Conta de Aluno
             </button>
           </div>
-
         </div>
       </div>
     );
@@ -379,11 +351,9 @@ function LoginPage() {
   return (
     <div style={{ minHeight: '85vh', padding: '6rem 1.5rem', backgroundColor: 'var(--bg-surface)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
       <div style={{ width: '100%', maxWidth: '440px', backgroundColor: 'var(--bg-app)', border: '1px solid var(--border-color)', borderRadius: 'var(--radius-lg)', padding: '3rem 2.5rem', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.05)' }}>
-        
         {/* Cabeçalho */}
         <div style={{ textAlign: 'center', marginBottom: '2.5rem' }}>
           <img src="https://brhsic-main.vercel.app/brand/brhsic-lockup.png" alt="BRHSIC Academy" className="bfa-brand-img" style={{ height: '40px', width: 'auto', marginBottom: '1.5rem', display: 'inline-block' }} />
-          
           <h1 style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--text-primary)', margin: '0 0 0.5rem 0' }}>
             {activeTab === 'student-register'
               ? 'Criar Conta de Aluno'
@@ -404,7 +374,6 @@ function LoginPage() {
             {errorMsg}
           </div>
         )}
-
         {successMsg && (
           <div style={{ padding: '1rem', borderRadius: 'var(--radius-md)', backgroundColor: 'var(--status-success-bg, #F0FDF4)', border: '1px solid #4ADE80', color: 'var(--status-success, #15803D)', fontSize: '0.875rem', marginBottom: '1.5rem', lineHeight: 1.5 }}>
             {successMsg}
@@ -433,7 +402,6 @@ function LoginPage() {
             >
               Entrar
             </button>
-
             <button
               type="button"
               onClick={() => handleTabChange('student-register')}
@@ -453,7 +421,6 @@ function LoginPage() {
             >
               Cadastrar
             </button>
-
           </div>
         )}
 
@@ -492,7 +459,6 @@ function LoginPage() {
                 style={{ width: '100%', padding: '0.875rem', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-color)', backgroundColor: 'var(--bg-surface)', color: 'var(--text-primary)', fontSize: '0.9375rem', outline: 'none' }}
               />
             </div>
-
             <div style={{ marginBottom: '1.5rem' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
                 <label htmlFor="bfa-student-password" style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-primary)' }}>
@@ -518,7 +484,6 @@ function LoginPage() {
                 style={{ width: '100%', padding: '0.875rem', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-color)', backgroundColor: 'var(--bg-surface)', color: 'var(--text-primary)', fontSize: '0.9375rem', outline: 'none' }}
               />
             </div>
-
             <button
               type="submit"
               disabled={isLoading}
@@ -554,7 +519,6 @@ function LoginPage() {
                 style={{ width: '100%', padding: '0.875rem', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-color)', backgroundColor: 'var(--bg-surface)', color: 'var(--text-primary)', fontSize: '0.9375rem', outline: 'none' }}
               />
             </div>
-
             <div style={{ marginBottom: '1.25rem' }}>
               <label htmlFor="bfa-register-username" style={{ display: 'block', fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-primary)', marginBottom: '0.5rem' }}>
                 E-mail
@@ -571,7 +535,6 @@ function LoginPage() {
                 style={{ width: '100%', padding: '0.875rem', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-color)', backgroundColor: 'var(--bg-surface)', color: 'var(--text-primary)', fontSize: '0.9375rem', outline: 'none' }}
               />
             </div>
-
             <div style={{ marginBottom: '1.5rem' }}>
               <label htmlFor="bfa-register-password" style={{ display: 'block', fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-primary)', marginBottom: '0.5rem' }}>
                 Senha (mínimo 6 caracteres)
@@ -588,7 +551,6 @@ function LoginPage() {
                 style={{ width: '100%', padding: '0.875rem', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-color)', backgroundColor: 'var(--bg-surface)', color: 'var(--text-primary)', fontSize: '0.9375rem', outline: 'none' }}
               />
             </div>
-
             <button
               type="submit"
               disabled={isLoading}
@@ -617,7 +579,6 @@ function LoginPage() {
                 style={{ width: '100%', padding: '1rem', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-color)', backgroundColor: 'var(--bg-surface)', color: 'var(--text-primary)', fontSize: '1.5rem', textAlign: 'center', letterSpacing: '0.25em', fontFamily: 'var(--font-mono)', outline: 'none' }}
               />
             </div>
-
             <button
               type="submit"
               disabled={isLoading}
@@ -626,7 +587,6 @@ function LoginPage() {
             >
               {isLoading ? 'Verificando...' : 'Confirmar e Conectar'}
             </button>
-
             <button
               type="button"
               className="btn-secondary"
@@ -644,7 +604,6 @@ function LoginPage() {
           <span>OU</span>
           <div style={{ flex: 1, height: '1px', backgroundColor: 'var(--border-color)' }} />
         </div>
-
         <a
           href="#/"
           style={{
@@ -663,7 +622,6 @@ function LoginPage() {
         >
           Continuar sem Conta (Apenas Local) →
         </a>
-
       </div>
     </div>
   );
